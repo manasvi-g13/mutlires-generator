@@ -1,0 +1,127 @@
+import { NextResponse } from "next/server";
+import { generateText } from "ai";
+import { InferenceClient } from "@huggingface/inference";
+import { queryTopJobListingsByEmbedding } from "@/lib/db";
+import { createDeepSeek } from '@ai-sdk/deepseek';
+
+const deepseek = createDeepSeek({
+  apiKey: process.env.OPENAI_API_KEY ?? '',
+});
+// 1. Force Node.js runtime because pdf-parse relies on Node internals
+export const runtime = "nodejs";
+
+async function embedWithMiniLM(text: string): Promise<number[]> {
+  const token = process.env.HF_TOKEN;
+  if (!token) {
+    throw new Error(
+      "HF_TOKEN is not set. Please add a Hugging Face token to use embeddings.",
+    );
+  }
+
+  const client = new InferenceClient(token);
+
+  const output = await client.featureExtraction({
+    model: "sentence-transformers/all-MiniLM-L6-v2",
+    inputs: text,
+  });
+
+  if (Array.isArray(output) && typeof output[0] === "number") {
+    return output as number[];
+  }
+  if (Array.isArray(output) && Array.isArray(output[0])) {
+    const tokens = output as number[][];
+    const dims = tokens[0]?.length ?? 0;
+    const sum = new Array(dims).fill(0) as number[];
+    for (const tok of tokens) {
+      for (let i = 0; i < dims; i++) sum[i] += tok[i] ?? 0;
+    }
+    return sum.map((v) => v / Math.max(tokens.length, 1));
+  }
+  throw new Error("Unexpected embedding response shape from HF");
+}
+
+async function extractTextFromRequest(req: Request): Promise<string> {
+  const contentType = req.headers.get("content-type") || "";
+  
+  if (contentType.includes("multipart/form-data")) {
+    const form = await req.formData();
+    const text = (form.get("resumeText") as string) || "";
+    const file = form.get("file") as File | null;
+
+    if (file && file.size > 0) {
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      // Lazy-import pdf-parse to avoid build issues
+      if (
+        file.type === "application/pdf" ||
+        file.name?.toLowerCase().endsWith(".pdf")
+      ) {
+        // 2. Corrected pdf-parse implementation
+        // The library exports a default function, NOT a class
+        const pdfParse = require("pdf-parse");
+        
+        try {
+          // pdf-parse takes the buffer directly and returns a promise
+          const data = await pdfParse(buffer);
+          const pdfText = data.text;
+          // Combine manually entered text with PDF text if both exist
+          return text ? `${text}\n\n${pdfText}` : pdfText;
+        } catch (e) {
+          console.error("PDF Parse Error:", e);
+          throw new Error("Failed to parse PDF file.");
+        }
+      }
+
+      // Fallback: try treat as UTF-8 text (e.g., .txt, .md files)
+      const utfText = buffer.toString("utf8");
+      return text ? `${text}\n\n${utfText}` : utfText;
+    }
+
+    if (text.trim().length > 0) return text;
+    throw new Error("No resume text or file provided in form data.");
+  }
+
+  // JSON body fallback
+  const body = (await req.json().catch(() => ({}))) as {
+    resumeText?: string;
+  };
+  const text = body?.resumeText?.trim();
+  if (text) return text;
+  throw new Error("No resume text provided.");
+}
+
+export async function POST(request: Request) {
+  try {
+    const resumeText = await extractTextFromRequest(request);
+    const embedding = await embedWithMiniLM(resumeText);
+
+    // Fetch top 3 jobs
+    const jobs = await queryTopJobListingsByEmbedding(embedding, 3);
+    
+
+    // Generate improvement suggestions per job
+    const { text: suggestions } = await generateText({
+      model: deepseek('deepseek-chat'),
+      system:
+        "You are a precise career coach. Compare a resume against job listings and give actionable, concise improvements.",
+      prompt: `Resume:\n"""\n${resumeText}\n"""\n\nTop 3 job listings (JSON):\n${JSON.stringify(
+        jobs.map((j) => ({
+          id: j.id,
+          title: j.title,
+          company: j.company,
+          location: j.location,
+        })),
+        null,
+        2,
+      )}\n\nFor each listing, provide:\n- 1-2 sentence fit summary\n- 5 specific resume improvements (skills, keywords, quantification, structure) tailored to that listing\n- A single tailored objective/summary line we could add to the resume\nFormat as Markdown with clear sections per job (use headings).`,
+    });
+
+    return NextResponse.json({ jobs, suggestions });
+  } catch (error) {
+    console.error("resume-match route error", error);
+    const message =
+      error instanceof Error ? error.message : "Unexpected server error";
+    return NextResponse.json({ error: message }, { status: 400 });
+  }
+}

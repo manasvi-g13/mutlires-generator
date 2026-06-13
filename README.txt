@@ -12,6 +12,18 @@ Job seekers often apply to dozens of positions using the same resume, resulting 
 
 MultiRes addresses this challenge by automatically analyzing both resumes and job descriptions, providing intelligent recommendations and resume enhancements.
 
+### Research Framework
+
+The project was developed as a multimodal AI framework combining OCR, embeddings, semantic similarity matching, and LLM-powered resume tailoring.
+
+![Research Framework](multires-research-framework.png)
+
+### Web Application
+
+Users can upload or paste their resume, identify matching jobs, and receive AI-generated recommendations for improving resume relevance.
+
+![Web Application](multires-web-app.png)
+
 ## Features
 
 - Resume parsing and analysis
